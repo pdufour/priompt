@@ -372,7 +372,8 @@ export type RenderOptions = {
 	// - static-btree: Static B+ tree optimized for efficient boundary searching with minimal jumps
 	// - worker-thread: Alias for static-btree (kept for backward compatibility)
 	// - genetic-algorithim: Genetic algorithm implementation for handling complex token count distributions
-	searchStrategy?: 'exponential-then-binary-search' | 'binary' | 'interpolation' | 'binned' | 'gpu-branchless' | 'learned-index' | 'bloom-filter' | 'simulated-annealing' | 'progressive-binary' | 'static-btree' | 'worker-thread' | 'genetic-algorithim';
+	// - ant-colony: Ant Colony Optimization algorithm that uses pheromone trails to efficiently find optimal priority levels
+	searchStrategy?: 'exponential-then-binary-search' | 'binary' | 'interpolation' | 'binned' | 'gpu-branchless' | 'learned-index' | 'bloom-filter' | 'simulated-annealing' | 'progressive-binary' | 'static-btree' | 'worker-thread' | 'genetic-algorithim' | 'ant-colony';
 };
 
 export type RenderunCountTokensFast_UNSAFE = "try_retry" | "yes" | "no";

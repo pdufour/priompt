@@ -5,6 +5,7 @@ import { runBinarySearch } from './binary-search';
 import { runExponentialSearch } from './exponential-search';
 import { runInterpolationSearch } from './interpolation-search';
 import { runGeneticSearch } from './genetic-search';
+import { runAntColonySearch } from './ant-colony-search';
 import { shouldPrintVerboseLogs } from '../lib';
 
 /**
@@ -68,6 +69,19 @@ export async function runSearchStrategy(
 			console.debug(`Using Genetic Algorithm search strategy`);
 		}
 		return runGeneticSearch(
+			elem,
+			sortedPriorityLevels,
+			tokenizer,
+			tokenLimit,
+			usedTokenlimit,
+			countTokensFast_UNSAFE,
+			lastMessageIsIncomplete
+		);
+	} else if (strategy === "ant-colony") {
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Using Ant Colony Optimization search strategy`);
+		}
+		return runAntColonySearch(
 			elem,
 			sortedPriorityLevels,
 			tokenizer,
