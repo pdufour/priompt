@@ -12,3 +12,5 @@ Cargo.lock
 Cargo.toml
 pnpm-workspace.yaml
 pnpm-lock.yaml
+
+testpriompt/

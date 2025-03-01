@@ -1,4 +1,3 @@
-
 // First picks out the first child (in order) that is prioritized enough
 
 import { JSONSchema7 } from 'json-schema';
@@ -359,6 +358,21 @@ export type RenderOptions = {
 
 	// if it is, then we need to count tokens differently
 	lastMessageIsIncomplete?: boolean;
+
+	// Strategy for searching priority levels:
+	// - binary: Classic binary search (default)
+	// - exponential-then-binary-search: Exponential search to quickly find a boundary, followed by binary search for precision
+	// - interpolation: Interpolation search for non-uniform distributions
+	// - binned: Bins priority levels into groups, uses binary search for bin selection and outward search within bins
+	// - gpu-branchless: GPU-accelerated branchless search for massively parallel evaluation
+	// - learned-index: Learned index search for potentially faster lookups
+	// - bloom-filter: Bloom filter for pre-rejection followed by binary search
+	// - simulated-annealing: Probabilistic metaheuristic that efficiently finds near-optimal solutions
+	// - progressive-binary: Progressive binary search for potentially faster lookups
+	// - static-btree: Static B+ tree optimized for efficient boundary searching with minimal jumps
+	// - worker-thread: Alias for static-btree (kept for backward compatibility)
+	// - genetic-algorithim: Genetic algorithm implementation for handling complex token count distributions
+	searchStrategy?: 'exponential-then-binary-search' | 'binary' | 'interpolation' | 'binned' | 'gpu-branchless' | 'learned-index' | 'bloom-filter' | 'simulated-annealing' | 'progressive-binary' | 'static-btree' | 'worker-thread' | 'genetic-algorithim';
 };
 
 export type RenderunCountTokensFast_UNSAFE = "try_retry" | "yes" | "no";

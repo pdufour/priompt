@@ -66,6 +66,7 @@
     "nodemon": "^2.0.22",
     "npm-run-all": "^4.1.5",
     "rimraf": "^5.0.0",
+    "rust-eytzinger": "link:../rust-eytzinger",
     "tiny-glob": "^0.2.9",
     "tsx": "^3.12.6",
     "typescript": "^5.2.0",
@@ -80,5 +81,8 @@
     "openai": "^3.3.0",
     "zod": "^3.21.4",
     "zod-to-json-schema": "^3.21.3"
+  },
+  "optionalDependencies": {
+    "@kmamal/gpu": "^0.2.0"
   }
 }

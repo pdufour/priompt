@@ -10,6 +10,7 @@ import { BaseProps, Node, ChatPrompt, Empty, First, RenderedPrompt, PromptElemen
 import { NewOutputCatcher } from './outputCatcher.ai';
 import { PreviewManager } from './preview';
 import { statsd } from './statsd';
+import { runSearchStrategy, SearchResult } from './search-strategies';
 
 function getImageMimeType(bytes: Uint8Array): string {
 	// Check the magic numbers
@@ -470,7 +471,7 @@ export async function render(elem: PromptElement, options: RenderOptions): Promi
 	// another idea is to implement this in Rust, and use the napi-rs library to call it from JS. in rust, implementing this would be trivial, because we would actually have a good data structure and memory management and parallelism (i think)
 
 	// return renderBackwardsLinearSearch(elem, options);
-	return await renderBinarySearch(elem, options);
+	return await _render(elem, options);
 }
 
 export async function renderPrompt<
@@ -773,9 +774,9 @@ export function renderCumulativeSum(
 }
 
 
-export async function renderBinarySearch(
+export async function _render(
 	elem: PromptElement,
-	{ tokenLimit, tokenizer, lastMessageIsIncomplete, countTokensFast_UNSAFE, shouldBuildSourceMap }: RenderOptions,
+	{ tokenLimit, tokenizer, lastMessageIsIncomplete, countTokensFast_UNSAFE, shouldBuildSourceMap, searchStrategy = "binary" }: RenderOptions,
 ): Promise<RenderOutput> {
 	const startTime = performance.now();
 	validateUnrenderedPrompt(elem);
@@ -836,46 +837,23 @@ export async function renderBinarySearch(
 	// if TOKEN LIMIT OK: then the answer has to be <= to the candidate
 	// if TOKEN LIMIT NOT OK: then the answer has to be > than the candidate
 	let largestTokenCountSeen = 0;
-	let exclusiveLowerBound = -1;
-	let inclusiveUpperBound = sortedPriorityLevels.length - 1;
 
-	while (exclusiveLowerBound < inclusiveUpperBound - 1) {
-		const candidateLevelIndex = Math.floor((exclusiveLowerBound + inclusiveUpperBound) / 2);
-		const candidateLevel = sortedPriorityLevels[candidateLevelIndex];
-		let start: number | undefined;
-		if (shouldPrintVerboseLogs()) {
-			console.debug(`Trying candidate level ${candidateLevel} with index ${candidateLevelIndex}`)
-			start = performance.now();
-		}
-		let countStart: number | undefined;
-		let tokenCount = -1;
-		try {
-			const prompt = renderWithLevelAndEarlyExitWithTokenEstimation(elem, candidateLevel, tokenizer, tokenLimit);
-			countStart = performance.now();
-			// const prompt = renderWithLevel(elem, candidateLevel);
-			if (countTokensFast_UNSAFE === true) {
-				tokenCount = await countTokensApproxFast_UNSAFE(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
-			} else {
-				tokenCount = await countTokensExact(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
-			}
-			largestTokenCountSeen = Math.max(largestTokenCountSeen, tokenCount);
-			if (tokenCount + prompt.emptyTokenCount > usedTokenlimit) {
-				// this means that the candidateLevel is too low
-				exclusiveLowerBound = candidateLevelIndex;
-			} else {
-				// this means the candidate level is too high or it is just right
-				inclusiveUpperBound = candidateLevelIndex;
-			}
-		} catch {
-			// this means the candidate level is too low
-			exclusiveLowerBound = candidateLevelIndex;
-		} finally {
-			if (shouldPrintVerboseLogs()) {
-				const end = performance.now();
-				console.debug(`Candidate level ${candidateLevel} with index ${candidateLevelIndex} took ${end - (start ?? 0)} ms and has ${tokenCount} tokens(-1 means early exit, counting took ${end - (countStart ?? 0)})`);
-			}
-		}
-	}
+	// Get search bounds based on the selected strategy
+	let { exclusiveLowerBound, inclusiveUpperBound, largestTokensSeen } = await runSearchStrategy(
+		searchStrategy,
+		elem,
+		sortedPriorityLevels,
+		tokenizer,
+		tokenLimit,
+		usedTokenlimit,
+		countTokensFast_UNSAFE,
+		lastMessageIsIncomplete
+	);
+
+	// Update largest tokens seen
+	largestTokenCountSeen = largestTokensSeen;
+
+	// Log the search completion
 	statsd.distribution('priompt.largestTokenCountSeen', largestTokenCountSeen, {
 		'bucketedLength': bucketedLength.toString()
 	});
@@ -890,7 +868,58 @@ export async function renderBinarySearch(
 	}
 
 	const renderWithLevelStartTime = performance.now();
-	const prompt = renderWithLevel(elem, sortedPriorityLevels[inclusiveUpperBound], tokenizer, true, shouldBuildSourceMap === true ? {
+	// Use the priority level from the binary search, with validation to ensure it exists
+	let finalPriorityLevel = sortedPriorityLevels[inclusiveUpperBound];
+
+	// Validate that we have a valid priority level
+	if (finalPriorityLevel === undefined || inclusiveUpperBound < 0 || inclusiveUpperBound >= sortedPriorityLevels.length) {
+		// This could happen if something went wrong with the search
+		if (shouldPrintVerboseLogs()) {
+			console.warn(`No valid priority level found at index ${inclusiveUpperBound}, falling back to BASE_PRIORITY`);
+		}
+		// Try to use BASE_PRIORITY if available
+		const basePriorityIndex = sortedPriorityLevels.findIndex(p => p === BASE_PRIORITY);
+		if (basePriorityIndex >= 0) {
+			finalPriorityLevel = BASE_PRIORITY;
+			inclusiveUpperBound = basePriorityIndex;
+		} else if (sortedPriorityLevels.length > 0) {
+			// Otherwise use the highest priority level (lowest index)
+			finalPriorityLevel = sortedPriorityLevels[0];
+			inclusiveUpperBound = 0;
+		} else {
+			// If no priority levels at all, use BASE_PRIORITY directly
+			finalPriorityLevel = BASE_PRIORITY;
+		}
+
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Using priority level ${finalPriorityLevel}`);
+		}
+	}
+
+	// Additional check to ensure finalPriorityLevel is not an extreme value
+	// This can happen with interpolation search in some edge cases
+	if (finalPriorityLevel === 1000000000 || Math.abs(finalPriorityLevel) > 10000000) {
+		if (shouldPrintVerboseLogs()) {
+			console.warn(`Found extreme priority level ${finalPriorityLevel}, resetting to a reasonable value`);
+		}
+
+		// Try to use BASE_PRIORITY if available
+		const basePriorityIndex = sortedPriorityLevels.findIndex(p => p === BASE_PRIORITY);
+		if (basePriorityIndex >= 0) {
+			finalPriorityLevel = BASE_PRIORITY;
+			inclusiveUpperBound = basePriorityIndex;
+		} else if (sortedPriorityLevels.length > 0) {
+			// Otherwise use the highest priority level (lowest index)
+			finalPriorityLevel = sortedPriorityLevels[0];
+			inclusiveUpperBound = 0;
+		}
+
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Reset to priority level ${finalPriorityLevel}`);
+		}
+	}
+
+	const prompt = renderWithLevel(elem, finalPriorityLevel, tokenizer, true, shouldBuildSourceMap === true ? {
 		name: 'root',
 		isLast: undefined,
 	} : undefined);
@@ -929,28 +958,360 @@ export async function renderBinarySearch(
 		throw new TooManyTokensForBasePriority(`Base prompt estimated token count is ${tokenCount} with ${prompt.emptyTokenCount} tokens reserved, which is higher than the limit ${tokenLimit}. This is probably a bug in the prompt — please add some priority levels to fix this.`);
 	}
 
-	const renderBinarySearchDuration = performance.now() - startTime;
-	statsd.distribution('priompt.renderBinarySearch', renderBinarySearchDuration, {
+	const _renderDuration = performance.now() - startTime;
+	statsd.distribution('priompt._render', _renderDuration, {
 		'bucketedLength': bucketedLength.toString()
 	});
-	if (shouldPrintVerboseLogs() && renderBinarySearchDuration > 100) {
-		console.warn(`Priompt WARNING: rendering prompt took ${renderBinarySearchDuration} ms, which is longer than the recommended maximum of 100 ms.Consider reducing the number of scopes you have.`)
+	if (shouldPrintVerboseLogs() && _renderDuration > 100) {
+		console.warn(`Priompt WARNING: rendering prompt took ${_renderDuration} ms, which is longer than the recommended maximum of 100 ms.Consider reducing the number of scopes you have.`)
 	}
+
+	// Ensure emptyTokenCount is never undefined to avoid "N/A" display
+	const tokensReservedValue = typeof prompt.emptyTokenCount === 'number' ? prompt.emptyTokenCount : 0;
+
 	return {
 		prompt: prompt.prompt ?? "",
 		tokenCount: tokenCount,
-		tokensReserved: prompt.emptyTokenCount,
+		tokensReserved: tokensReservedValue,
 		tokenLimit: tokenLimit,
 		tokenizer,
-		durationMs: renderBinarySearchDuration,
+		durationMs: _renderDuration,
 		outputHandlers: prompt.outputHandlers,
 		streamHandlers: prompt.streamHandlers,
 		streamResponseObjectHandlers: prompt.streamResponseObjectHandlers,
-		priorityCutoff: sortedPriorityLevels[inclusiveUpperBound],
+		priorityCutoff: finalPriorityLevel,
 		sourceMap: prompt.sourceMap,
 		config: prompt.config,
 	};
+}
 
+/**
+ * Interface defining the common return type for all search strategies
+ */
+// SearchResult interface moved to search-strategies/index.ts
+
+/**
+ * Selects and runs the appropriate search strategy based on the provided strategy name
+ */
+// runSearchStrategy function moved to search-strategies/search-strategy.ts
+
+/**
+ * Runs a standard binary search to find the optimal priority level
+ */
+async function runBinarySearch(
+	elem: PromptElement,
+	sortedPriorityLevels: number[],
+	tokenizer: PriomptTokenizer,
+	tokenLimit: number,
+	usedTokenlimit: number,
+	countTokensFast_UNSAFE: boolean | undefined,
+	lastMessageIsIncomplete: boolean | undefined
+): Promise<SearchResult> {
+	let largestTokenCountSeen = 0;
+	let exclusiveLowerBound = -1;
+	let inclusiveUpperBound = sortedPriorityLevels.length - 1;
+
+	// Standard binary search phase
+	let binarySearchFailed = false;
+	while (exclusiveLowerBound < inclusiveUpperBound - 1) {
+		const candidateLevelIndex = Math.floor((exclusiveLowerBound + inclusiveUpperBound) / 2);
+		const candidateLevel = sortedPriorityLevels[candidateLevelIndex];
+		let start: number | undefined;
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Binary search - Trying candidate level ${candidateLevel} with index ${candidateLevelIndex}`)
+			start = performance.now();
+		}
+		let countStart: number | undefined;
+		let tokenCount = -1;
+		try {
+			const prompt = renderWithLevelAndEarlyExitWithTokenEstimation(elem, candidateLevel, tokenizer, tokenLimit);
+			countStart = performance.now();
+
+			if (countTokensFast_UNSAFE === true) {
+				tokenCount = await countTokensApproxFast_UNSAFE(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
+			} else {
+				tokenCount = await countTokensExact(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
+			}
+
+			largestTokenCountSeen = Math.max(largestTokenCountSeen, tokenCount);
+
+			if (tokenCount + prompt.emptyTokenCount > usedTokenlimit) {
+				// this means that the candidateLevel is too low
+				exclusiveLowerBound = candidateLevelIndex;
+			} else {
+				// this means the candidate level is too high or it is just right
+				inclusiveUpperBound = candidateLevelIndex;
+			}
+		} catch {
+			// this means the candidate level is too low
+			exclusiveLowerBound = candidateLevelIndex;
+		} finally {
+			if (shouldPrintVerboseLogs()) {
+				const end = performance.now();
+				console.debug(`Binary search - Candidate level ${candidateLevel} with index ${candidateLevelIndex} took ${end - (start ?? 0)} ms and has ${tokenCount} tokens(-1 means early exit, counting took ${end - (countStart ?? 0)})`);
+			}
+		}
+	}
+
+	// Verify that we have a valid solution
+	// If exclusiveLowerBound == sortedPriorityLevels.length - 1, then binary search failed to find a valid level
+	if (exclusiveLowerBound === sortedPriorityLevels.length - 1) {
+		binarySearchFailed = true;
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Binary search failed to find a priority level that fits within token limit`);
+		}
+		// Try the highest priority level (most restrictive) as a last resort
+		inclusiveUpperBound = 0;
+	}
+
+	return {
+		exclusiveLowerBound,
+		inclusiveUpperBound,
+		largestTokensSeen: largestTokenCountSeen
+	};
+}
+
+/**
+ * Runs an exponential search followed by a binary search in a narrower range
+ */
+async function runExponentialSearch(
+	elem: PromptElement,
+	sortedPriorityLevels: number[],
+	tokenizer: PriomptTokenizer,
+	tokenLimit: number,
+	usedTokenlimit: number,
+	countTokensFast_UNSAFE: boolean | undefined,
+	lastMessageIsIncomplete: boolean | undefined
+): Promise<SearchResult> {
+	let largestTokenCountSeen = 0;
+	let exclusiveLowerBound = -1;
+	let inclusiveUpperBound = sortedPriorityLevels.length - 1;
+
+	// EXPONENTIAL BINARY SEARCH
+	// First phase: exponential stride to find upper bound
+	let stride = 1;
+	let index = 0;
+	let upperBound = -1; // Start with -1 to indicate "not found yet"
+	let foundFittingLevel = false;
+
+	while (index < sortedPriorityLevels.length) {
+		const priorityLevel = sortedPriorityLevels[index];
+		let start: number | undefined;
+
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Exponential search - Trying priority level ${priorityLevel} with index ${index}`)
+			start = performance.now();
+		}
+
+		let tokenCount = -1;
+		let countStart: number | undefined;
+
+		try {
+			const prompt = renderWithLevelAndEarlyExitWithTokenEstimation(elem, priorityLevel, tokenizer, tokenLimit);
+			countStart = performance.now();
+
+			if (countTokensFast_UNSAFE === true) {
+				tokenCount = await countTokensApproxFast_UNSAFE(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
+			} else {
+				tokenCount = await countTokensExact(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
+			}
+
+			largestTokenCountSeen = Math.max(largestTokenCountSeen, tokenCount);
+
+			if (tokenCount + prompt.emptyTokenCount <= usedTokenlimit) {
+				// This fits, remember this index as our upperBound
+				upperBound = index;
+				foundFittingLevel = true;
+
+				// Exponentially increase stride to find next test point
+				index += stride;
+				stride *= 2;
+			} else {
+				// Found a level that doesn't fit, break to binary search
+				break;
+			}
+		} catch {
+			// Level is too low, move to next with exponential stride
+			index += stride;
+			stride *= 2;
+		} finally {
+			if (shouldPrintVerboseLogs()) {
+				const end = performance.now();
+				console.debug(`Exponential search - Priority ${priorityLevel} with index ${index - 1} took ${end - (start ?? 0)} ms and has ${tokenCount} tokens (counting took ${end - (countStart ?? 0)})`);
+			}
+		}
+	}
+
+	// If we didn't find a fitting level with exponential search, fall back to standard binary search
+	if (!foundFittingLevel) {
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`No fitting level found with exponential search, falling back to standard binary search`);
+		}
+		// Reset bounds to the default for binary search
+		return await runBinarySearch(elem, sortedPriorityLevels, tokenizer, tokenLimit, usedTokenlimit, countTokensFast_UNSAFE, lastMessageIsIncomplete);
+	} else {
+		// Second phase: binary search in the range [upperBound, min(upperBound+stride/2, length)]
+		const lowerBound = upperBound;
+		const newUpperBound = Math.min(upperBound + stride / 2, sortedPriorityLevels.length - 1);
+
+		// Set the bounds for the binary search
+		exclusiveLowerBound = lowerBound - 1;  // Make it exclusive
+		inclusiveUpperBound = newUpperBound;
+
+		if (shouldPrintVerboseLogs()) {
+			console.debug(`Switching to binary search in range [${exclusiveLowerBound + 1}, ${inclusiveUpperBound}]`);
+		}
+
+		// Run binary search in the narrowed range
+		// Create a view of the sortedPriorityLevels array for the narrowed range
+		const narrowedRange = sortedPriorityLevels.slice(lowerBound, newUpperBound + 1);
+		const offsetFromOriginal = lowerBound;
+
+		// If the narrowed range is too small, just use the results we have
+		if (narrowedRange.length <= 2) {
+			return {
+				exclusiveLowerBound,
+				inclusiveUpperBound: lowerBound, // Use the known good level
+				largestTokensSeen: largestTokenCountSeen
+			};
+		}
+
+		// Run binary search on the narrowed range
+		const result = await runBinarySearch(elem, narrowedRange, tokenizer, tokenLimit, usedTokenlimit, countTokensFast_UNSAFE, lastMessageIsIncomplete);
+
+		// Translate the result back to the original array indices
+		return {
+			exclusiveLowerBound: result.exclusiveLowerBound < 0 ? exclusiveLowerBound : result.exclusiveLowerBound + offsetFromOriginal,
+			inclusiveUpperBound: result.inclusiveUpperBound + offsetFromOriginal,
+			largestTokensSeen: Math.max(largestTokenCountSeen, result.largestTokensSeen)
+		};
+	}
+}
+
+/**
+ * Runs an interpolation search to find the optimal priority level
+ */
+async function runInterpolationSearch(
+	elem: PromptElement,
+	sortedPriorityLevels: number[],
+	tokenizer: PriomptTokenizer,
+	tokenLimit: number,
+	usedTokenlimit: number,
+	countTokensFast_UNSAFE: boolean | undefined,
+	lastMessageIsIncomplete: boolean | undefined
+): Promise<SearchResult> {
+	// Basic setup
+	let largestTokenCountSeen = 0;
+	let exclusiveLowerBound = -1;
+	let inclusiveUpperBound = 0; // Default to highest priority level
+
+	// Early return for empty array
+	if (sortedPriorityLevels.length === 0) {
+		return { exclusiveLowerBound, inclusiveUpperBound, largestTokensSeen: largestTokenCountSeen };
+	}
+
+	// Cache to store token counts for each tested level
+	const tokenCounts = new Map<number, number>();
+
+	// Helper function to test priority level
+	async function testLevel(index: number): Promise<boolean> {
+		const level = sortedPriorityLevels[index];
+
+		if (tokenCounts.has(level)) {
+			return tokenCounts.get(level)! <= usedTokenlimit;
+		}
+
+		try {
+			const prompt = renderWithLevelAndEarlyExitWithTokenEstimation(elem, level, tokenizer, tokenLimit);
+			let tokens: number;
+
+			if (countTokensFast_UNSAFE === true) {
+				tokens = await countTokensApproxFast_UNSAFE(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
+			} else {
+				tokens = await countTokensExact(tokenizer, prompt.prompt ?? "", { lastMessageIsIncomplete });
+			}
+
+			largestTokenCountSeen = Math.max(largestTokenCountSeen, tokens);
+			const totalTokens = tokens + (prompt.emptyTokenCount || 0);
+			tokenCounts.set(level, totalTokens);
+
+			return totalTokens <= usedTokenlimit;
+		} catch (e) {
+			tokenCounts.set(level, Number.MAX_SAFE_INTEGER);
+			return false;
+		}
+	}
+
+	// Start with bounds at each end
+	let low = 0;  // Highest priority (most restrictive)
+	let high = sortedPriorityLevels.length - 1;  // Lowest priority (least restrictive)
+
+	// First test the highest priority
+	const highestFits = await testLevel(low);
+	if (!highestFits) {
+		// If even the highest priority doesn't fit, return an appropriate result
+		// indicating that nothing fits within the token limit
+		return {
+			exclusiveLowerBound: -1,
+			inclusiveUpperBound: 0,
+			largestTokensSeen: largestTokenCountSeen
+		};
+	}
+
+	// Already know the highest priority fits
+	let bestFittingIndex = low;
+
+	// Simple interpolation search
+	while (low <= high) {
+		// If we're down to adjacent levels, we're done
+		if (high - low <= 1) {
+			break;
+		}
+
+		// Make sure we have token counts for endpoints
+		if (!tokenCounts.has(sortedPriorityLevels[low])) await testLevel(low);
+		if (!tokenCounts.has(sortedPriorityLevels[high])) await testLevel(high);
+
+		// Get token counts
+		const lowTokens = tokenCounts.get(sortedPriorityLevels[low])!;
+		const highTokens = tokenCounts.get(sortedPriorityLevels[high])!;
+
+		// If high point also fits or token counts are equal, just use binary search for this step
+		if (highTokens <= usedTokenlimit || lowTokens === highTokens) {
+			const mid = Math.floor((low + high) / 2);
+			const fits = await testLevel(mid);
+
+			if (fits) {
+				low = mid;  // Move up
+				bestFittingIndex = mid;
+			} else {
+				high = mid - 1;  // Move down
+			}
+			continue;
+		}
+
+		// Calculate interpolation point
+		const pos = Math.floor(low + ((usedTokenlimit - lowTokens) * (high - low)) / (highTokens - lowTokens));
+
+		// Ensure we're within bounds and not retesting endpoints
+		const midPos = Math.max(low + 1, Math.min(high - 1, pos));
+
+		// Test the interpolated position
+		const fits = await testLevel(midPos);
+
+		if (fits) {
+			low = midPos;  // Move up
+			bestFittingIndex = midPos;
+		} else {
+			high = midPos - 1;  // Move down
+		}
+	}
+
+	return {
+		exclusiveLowerBound: bestFittingIndex - 1,
+		inclusiveUpperBound: bestFittingIndex,
+		largestTokensSeen: largestTokenCountSeen
+	};
 }
 
 export async function renderBackwardsLinearSearch(elem: PromptElement, { tokenLimit, tokenizer, lastMessageIsIncomplete }: RenderOptions): Promise<RenderOutput> {
@@ -1728,7 +2089,7 @@ function renderWithLevelAndEarlyExitWithTokenEstimation(elem: PromptElement, lev
 						message = {
 							role: elem.role,
 							to: elem.to,
-							content: isPlainPrompt(p.prompt) ? p.prompt : (p.prompt?.text),
+							content: isPlainPrompt(p.prompt) ? p.prompt : (p.prompt?.text ?? ""),
 							toolCalls: elem.toolCalls,
 						}
 					} else {
@@ -2142,7 +2503,7 @@ function renderWithLevel(
 						message = {
 							role: elem.role,
 							to: elem.to,
-							content: isPlainPrompt(p.prompt) ? p.prompt : (p.prompt?.text),
+							content: isPlainPrompt(p.prompt) ? p.prompt : (p.prompt?.text ?? ""),
 							toolCalls: elem.toolCalls,
 						}
 					} else {
@@ -2158,8 +2519,8 @@ function renderWithLevel(
 					}
 					message = {
 						role: elem.role,
-						to: elem.to,
 						name: elem.name,
+						to: elem.to,
 						content: isPlainPrompt(p.prompt) ? p.prompt : (p.prompt?.text ?? ""),
 					}
 				} else if (elem.role === 'tool') {
@@ -3138,3 +3499,11 @@ export class TooManyTokensForBasePriority extends Error {
 		this.name = "TooManyTokensForBasePriority";
 	}
 }
+
+// Export these functions for our Rust integration
+export {
+	shouldPrintVerboseLogs,
+	renderWithLevelAndEarlyExitWithTokenEstimation,
+	countTokensApproxFast_UNSAFE,
+	countTokensExact
+};
